@@ -364,6 +364,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Recording", "Nahrávání"),
         ("Directory", "Adresář"),
         ("Automatically record incoming sessions", "Automaticky nahrávat příchozí relace"),
+        ("Automatically record outgoing sessions", ""),
         ("Change", "Změnit"),
         ("Start session recording", "Spustit záznam relace"),
         ("Stop session recording", "Zastavit záznam relace"),
@@ -644,5 +645,13 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Parent directory", "Rodičovský adresář"),
         ("Resume", "Pokračovat"),
         ("Invalid file name", "Nesprávný název souboru"),
+        ("one-way-file-transfer-tip", ""),
+        ("Authentication Required", ""),
+        ("Authenticate", ""),
+        ("web_id_input_tip", ""),
+        ("Download", ""),
+        ("Upload folder", ""),
+        ("Upload files", ""),
+        ("Clipboard is synchronized", ""),
     ].iter().cloned().collect();
 }

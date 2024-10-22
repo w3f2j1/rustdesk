@@ -30,7 +30,6 @@ pub use file_trait::FileManager;
 #[cfg(not(feature = "flutter"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::UnboundedSender;
-use hbb_common::tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use hbb_common::{
     allow_err,
     anyhow::{anyhow, Context},
@@ -54,11 +53,15 @@ use hbb_common::{
     },
     AddrMangle, ResultType, Stream,
 };
+use hbb_common::{
+    config::keys::OPTION_ALLOW_AUTO_RECORD_OUTGOING,
+    tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver},
+};
 pub use helper::*;
 use scrap::{
     codec::Decoder,
     record::{Recorder, RecorderContext},
-    CodecFormat, ImageFormat, ImageRgb,
+    CodecFormat, ImageFormat, ImageRgb, ImageTexture,
 };
 
 use crate::{
@@ -84,7 +87,7 @@ pub mod io_loop;
 pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
 pub const VIDEO_QUEUE_SIZE: usize = 120;
-const MAX_DECODE_FAIL_COUNTER: usize = 10; // Currently, failed decode cause refresh_video, so make it small
+const MAX_DECODE_FAIL_COUNTER: usize = 3;
 
 #[cfg(target_os = "linux")]
 pub const LOGIN_MSG_DESKTOP_NOT_INITED: &str = "Desktop env is not inited";
@@ -1146,11 +1149,12 @@ impl AudioHandler {
 pub struct VideoHandler {
     decoder: Decoder,
     pub rgb: ImageRgb,
-    pub texture: *mut c_void,
+    pub texture: ImageTexture,
     recorder: Arc<Mutex<Option<Recorder>>>,
     record: bool,
     _display: usize, // useful for debug
     fail_counter: usize,
+    first_frame: bool,
 }
 
 impl VideoHandler {
@@ -1171,11 +1175,12 @@ impl VideoHandler {
         VideoHandler {
             decoder: Decoder::new(format, luid),
             rgb: ImageRgb::new(ImageFormat::ARGB, crate::get_dst_align_rgba()),
-            texture: std::ptr::null_mut(),
+            texture: Default::default(),
             recorder: Default::default(),
             record: false,
             _display,
             fail_counter: 0,
+            first_frame: true,
         }
     }
 
@@ -1204,15 +1209,28 @@ impl VideoHandler {
                     self.fail_counter = 0;
                 } else {
                     if self.fail_counter < usize::MAX {
-                        self.fail_counter += 1
+                        if self.first_frame && self.fail_counter < MAX_DECODE_FAIL_COUNTER {
+                            log::error!("decode first frame failed");
+                            self.fail_counter = MAX_DECODE_FAIL_COUNTER;
+                        } else {
+                            self.fail_counter += 1;
+                        }
+                        log::error!(
+                            "Failed to handle video frame, fail counter: {}",
+                            self.fail_counter
+                        );
                     }
                 }
+                self.first_frame = false;
                 if self.record {
-                    self.recorder
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .map(|r| r.write_frame(frame));
+                    self.recorder.lock().unwrap().as_mut().map(|r| {
+                        let (w, h) = if *pixelbuffer {
+                            (self.rgb.w, self.rgb.h)
+                        } else {
+                            (self.texture.w, self.texture.h)
+                        };
+                        r.write_frame(frame, w, h).ok();
+                    });
                 }
                 res
             }
@@ -1222,26 +1240,28 @@ impl VideoHandler {
 
     /// Reset the decoder, change format if it is Some
     pub fn reset(&mut self, format: Option<CodecFormat>) {
+        log::info!(
+            "reset video handler for display #{}, format: {format:?}",
+            self._display
+        );
         #[cfg(target_os = "macos")]
         self.rgb.set_align(crate::get_dst_align_rgba());
         let luid = Self::get_adapter_luid();
         let format = format.unwrap_or(self.decoder.format());
         self.decoder = Decoder::new(format, luid);
         self.fail_counter = 0;
+        self.first_frame = true;
     }
 
     /// Start or stop screen record.
-    pub fn record_screen(&mut self, start: bool, w: i32, h: i32, id: String) {
+    pub fn record_screen(&mut self, start: bool, id: String, display: usize) {
         self.record = false;
         if start {
             self.recorder = Recorder::new(RecorderContext {
                 server: false,
                 id,
                 dir: crate::ui_interface::video_save_directory(false),
-                filename: "".to_owned(),
-                width: w as _,
-                height: h as _,
-                format: scrap::CodecFormat::VP9,
+                display,
                 tx: None,
             })
             .map_or(Default::default(), |r| Arc::new(Mutex::new(Some(r))));
@@ -1330,6 +1350,7 @@ pub struct LoginConfigHandler {
     password_source: PasswordSource, // where the sent password comes from
     shared_password: Option<String>, // Store the shared password
     pub enable_trusted_devices: bool,
+    pub record: bool,
 }
 
 impl Deref for LoginConfigHandler {
@@ -1421,6 +1442,7 @@ impl LoginConfigHandler {
         self.adapter_luid = adapter_luid;
         self.selected_windows_session_id = None;
         self.shared_password = shared_password;
+        self.record = LocalConfig::get_bool_option(OPTION_ALLOW_AUTO_RECORD_OUTGOING);
     }
 
     /// Check if the client should auto login.
@@ -1781,28 +1803,6 @@ impl LoginConfigHandler {
             self.adapter_luid,
             &self.mark_unsupported,
         )
-    }
-
-    pub fn get_option_message_after_login(&self) -> Option<OptionMessage> {
-        if self.conn_type.eq(&ConnType::FILE_TRANSFER)
-            || self.conn_type.eq(&ConnType::PORT_FORWARD)
-            || self.conn_type.eq(&ConnType::RDP)
-        {
-            return None;
-        }
-        let mut n = 0;
-        let mut msg = OptionMessage::new();
-        if self.version < hbb_common::get_version_number("1.2.4") {
-            if self.get_toggle_option("privacy-mode") {
-                msg.privacy_mode = BoolOption::Yes.into();
-                n += 1;
-            }
-        }
-        if n > 0 {
-            Some(msg)
-        } else {
-            None
-        }
     }
 
     /// Parse the image quality option.
@@ -2232,7 +2232,7 @@ pub enum MediaData {
     AudioFrame(Box<AudioFrame>),
     AudioFormat(AudioFormat),
     Reset(Option<usize>),
-    RecordScreen(bool, usize, i32, i32, String),
+    RecordScreen(bool),
 }
 
 pub type MediaSender = mpsc::Sender<MediaData>;
@@ -2308,10 +2308,16 @@ where
                         let start = std::time::Instant::now();
                         let format = CodecFormat::from(&vf);
                         if !handler_controller_map.contains_key(&display) {
+                            let mut handler = VideoHandler::new(format, display);
+                            let record = session.lc.read().unwrap().record;
+                            let id = session.lc.read().unwrap().id.clone();
+                            if record {
+                                handler.record_screen(record, id, display);
+                            }
                             handler_controller_map.insert(
                                 display,
                                 VideoHandlerController {
-                                    handler: VideoHandler::new(format, display),
+                                    handler,
                                     skip_beginning: 0,
                                 },
                             );
@@ -2330,7 +2336,7 @@ where
                                     video_callback(
                                         display,
                                         &mut handler_controller.handler.rgb,
-                                        handler_controller.handler.texture,
+                                        handler_controller.handler.texture.texture,
                                         pixelbuffer,
                                     );
 
@@ -2404,18 +2410,19 @@ where
                             }
                         }
                     }
-                    MediaData::RecordScreen(start, display, w, h, id) => {
-                        log::info!("record screen command: start: {start}, display: {display}");
-                        // Compatible with the sciter version(single ui session).
-                        // For the sciter version, there're no multi-ui-sessions for one connection.
-                        // The display is always 0, video_handler_controllers.len() is always 1. So we use the first video handler.
-                        if let Some(handler_controler) = handler_controller_map.get_mut(&display) {
-                            handler_controler.handler.record_screen(start, w, h, id);
-                        } else if handler_controller_map.len() == 1 {
-                            if let Some(handler_controler) =
-                                handler_controller_map.values_mut().next()
-                            {
-                                handler_controler.handler.record_screen(start, w, h, id);
+                    MediaData::RecordScreen(start) => {
+                        log::info!("record screen command: start: {start}");
+                        let record = session.lc.read().unwrap().record;
+                        session.update_record_status(start);
+                        if record != start {
+                            session.lc.write().unwrap().record = start;
+                            let id = session.lc.read().unwrap().id.clone();
+                            for (display, handler_controler) in handler_controller_map.iter_mut() {
+                                handler_controler.handler.record_screen(
+                                    start,
+                                    id.clone(),
+                                    *display,
+                                );
                             }
                         }
                     }
@@ -3174,7 +3181,7 @@ pub enum Data {
     SetConfirmOverrideFile((i32, i32, bool, bool, bool)),
     AddJob((i32, String, String, i32, bool, bool)),
     ResumeJob((i32, bool)),
-    RecordScreen(bool, usize, i32, i32, String),
+    RecordScreen(bool),
     ElevateDirect,
     ElevateWithLogon(String, String),
     NewVoiceCall,
@@ -3419,7 +3426,6 @@ pub mod peer_online {
         tcp::FramedStream,
         ResultType,
     };
-    use std::time::Instant;
 
     pub async fn query_online_states<F: FnOnce(Vec<String>, Vec<String>)>(ids: Vec<String>, f: F) {
         let test = false;
@@ -3429,29 +3435,14 @@ pub mod peer_online {
             let offlines = onlines.drain((onlines.len() / 2)..).collect();
             f(onlines, offlines)
         } else {
-            let query_begin = Instant::now();
             let query_timeout = std::time::Duration::from_millis(3_000);
-            loop {
-                match query_online_states_(&ids, query_timeout).await {
-                    Ok((onlines, offlines)) => {
-                        f(onlines, offlines);
-                        break;
-                    }
-                    Err(e) => {
-                        log::debug!("{}", &e);
-                    }
+            match query_online_states_(&ids, query_timeout).await {
+                Ok((onlines, offlines)) => {
+                    f(onlines, offlines);
                 }
-
-                if query_begin.elapsed() > query_timeout {
-                    log::debug!(
-                        "query onlines timeout {:?} ({:?})",
-                        query_begin.elapsed(),
-                        query_timeout
-                    );
-                    break;
+                Err(e) => {
+                    log::debug!("query onlines, {}", &e);
                 }
-
-                sleep(1.5).await;
             }
         }
     }
@@ -3475,8 +3466,6 @@ pub mod peer_online {
         ids: &Vec<String>,
         timeout: std::time::Duration,
     ) -> ResultType<(Vec<String>, Vec<String>)> {
-        let query_begin = Instant::now();
-
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_online_request(OnlineRequest {
             id: Config::get_id(),
@@ -3484,24 +3473,28 @@ pub mod peer_online {
             ..Default::default()
         });
 
-        loop {
-            let mut socket = match create_online_stream().await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::debug!("Failed to create peers online stream, {e}");
-                    return Ok((vec![], ids.clone()));
-                }
-            };
-            // TODO: Use long connections to avoid socket creation
-            // If we use a Arc<Mutex<Option<FramedStream>>> to hold and reuse the previous socket,
-            // we may face the following error:
-            // An established connection was aborted by the software in your host machine. (os error 10053)
-            if let Err(e) = socket.send(&msg_out).await {
-                log::debug!("Failed to send peers online states query, {e}");
+        let mut socket = match create_online_stream().await {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("Failed to create peers online stream, {e}");
                 return Ok((vec![], ids.clone()));
             }
-            if let Some(msg_in) =
-                crate::common::get_next_nonkeyexchange_msg(&mut socket, None).await
+        };
+        // TODO: Use long connections to avoid socket creation
+        // If we use a Arc<Mutex<Option<FramedStream>>> to hold and reuse the previous socket,
+        // we may face the following error:
+        // An established connection was aborted by the software in your host machine. (os error 10053)
+        if let Err(e) = socket.send(&msg_out).await {
+            log::debug!("Failed to send peers online states query, {e}");
+            return Ok((vec![], ids.clone()));
+        }
+        // Retry for 2 times to get the online response
+        for _ in 0..2 {
+            if let Some(msg_in) = crate::common::get_next_nonkeyexchange_msg(
+                &mut socket,
+                Some(timeout.as_millis() as _),
+            )
+            .await
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::OnlineResponse(online_response)) => {
@@ -3527,13 +3520,9 @@ pub mod peer_online {
                 // TODO: Make sure socket closed?
                 bail!("Online stream receives None");
             }
-
-            if query_begin.elapsed() > timeout {
-                bail!("Try query onlines timeout {:?}", &timeout);
-            }
-
-            sleep(300.0).await;
         }
+
+        bail!("Failed to query online states, no online response");
     }
 
     #[cfg(test)]
