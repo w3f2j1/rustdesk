@@ -120,6 +120,7 @@ class FfiModel with ChangeNotifier {
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
   var _reconnects = 1;
+  DateTime? _offlineReconnectStartTime;
   bool _viewOnly = false;
   bool _showMyCursor = false;
   WeakReference<FFI> parent;
@@ -159,6 +160,8 @@ class FfiModel with ChangeNotifier {
   bool get isPeerAndroid => _pi.platform == kPeerPlatformAndroid;
   bool get isPeerMobile => isPeerAndroid;
 
+  bool get isPeerLinux => _pi.platform == kPeerPlatformLinux;
+
   bool get viewOnly => _viewOnly;
   bool get showMyCursor => _showMyCursor;
 
@@ -178,6 +181,9 @@ class FfiModel with ChangeNotifier {
   Rect? _getDisplaysRect(List<Display> displays, bool useDisplayScale) {
     if (displays.isEmpty) {
       return null;
+    }
+    if (isPeerLinux) {
+      useDisplayScale = true;
     }
     int scale(int len, double s) {
       if (useDisplayScale) {
@@ -208,6 +214,9 @@ class FfiModel with ChangeNotifier {
   }
 
   updatePermission(Map<String, dynamic> evt, String id) {
+    // Track previous keyboard permission to detect revocation.
+    final hadKeyboardPerm = _permissions['keyboard'] != false;
+
     evt.forEach((k, v) {
       if (k == 'name' || k.isEmpty) return;
       _permissions[k] = v == 'true';
@@ -216,6 +225,18 @@ class FfiModel with ChangeNotifier {
     if (parent.target?.connType == ConnType.defaultConn) {
       KeyboardEnabledState.find(id).value = _permissions['keyboard'] != false;
     }
+
+    // If keyboard permission was revoked while relative mouse mode is active,
+    // forcefully disable relative mouse mode to prevent the user from being trapped.
+    final hasKeyboardPerm = _permissions['keyboard'] != false;
+    if (hadKeyboardPerm && !hasKeyboardPerm) {
+      final inputModel = parent.target?.inputModel;
+      if (inputModel != null && inputModel.relativeMouseMode.value) {
+        inputModel.setRelativeMouseMode(false);
+        showToast(translate('rel-mouse-permission-lost-tip'));
+      }
+    }
+
     debugPrint('updatePermission: $_permissions');
     notifyListeners();
   }
@@ -358,7 +379,7 @@ class FfiModel with ChangeNotifier {
           parent.target?.fileModel.refreshAll();
         }
       } else if (name == 'job_error') {
-        parent.target?.fileModel.jobController.jobError(evt);
+        parent.target?.fileModel.handleJobError(evt);
       } else if (name == 'override_file_confirm') {
         parent.target?.fileModel.postOverrideFileConfirm(evt);
       } else if (name == 'load_last_job') {
@@ -452,6 +473,9 @@ class FfiModel with ChangeNotifier {
         _handlePrinterRequest(evt, sessionId, peerId);
       } else if (name == 'screenshot') {
         _handleScreenshot(evt, sessionId, peerId);
+      } else if (name == 'exit_relative_mouse_mode') {
+        // Handle exit shortcut from rdev grab loop (Ctrl+Alt on Win/Linux, Cmd+G on macOS)
+        parent.target?.inputModel.exitRelativeMouseModeWithKeyRelease();
       } else {
         debugPrint('Event is not handled in the fixed branch: $name');
       }
@@ -760,7 +784,8 @@ class FfiModel with ChangeNotifier {
     }
   }
 
-  updateCurDisplay(SessionID sessionId, {updateCursorPos = false}) {
+  Future<void> updateCurDisplay(SessionID sessionId,
+      {updateCursorPos = false}) async {
     final newRect = displaysRect();
     if (newRect == null) {
       return;
@@ -772,9 +797,19 @@ class FfiModel with ChangeNotifier {
             updateCursorPos: updateCursorPos);
       }
       _rect = newRect;
-      parent.target?.canvasModel
+      // Await updateViewStyle to ensure view geometry is fully updated before
+      // updating pointer lock center. This prevents stale center calculations.
+      await parent.target?.canvasModel
           .updateViewStyle(refreshMousePos: updateCursorPos);
       _updateSessionWidthHeight(sessionId);
+
+      // Keep pointer lock center in sync when using relative mouse mode.
+      // Note: updatePointerLockCenter is async-safe (handles errors internally),
+      // so we fire-and-forget here.
+      final inputModel = parent.target?.inputModel;
+      if (inputModel != null && inputModel.relativeMouseMode.value) {
+        inputModel.updatePointerLockCenter();
+      }
     }
   }
 
@@ -858,6 +893,17 @@ class FfiModel with ChangeNotifier {
     final title = evt['title'];
     final text = evt['text'];
     final link = evt['link'];
+
+    // Disable relative mouse mode on any error-type message to ensure cursor is released.
+    // This includes connection errors, session-ending messages, elevation errors, etc.
+    // Safety: releasing pointer lock on errors prevents the user from being stuck.
+    if (title == 'Connection Error' ||
+        type == 'error' ||
+        type == 'restarting' ||
+        (type is String && type.contains('error'))) {
+      parent.target?.inputModel.setRelativeMouseMode(false);
+    }
+
     if (type == 're-input-password') {
       wrongPasswordDialog(sessionId, dialogManager, type, title, text);
     } else if (type == 'input-2fa') {
@@ -895,9 +941,44 @@ class FfiModel with ChangeNotifier {
       showPrivacyFailedDialog(
           sessionId, type, title, text, link, hasRetry, dialogManager);
     } else {
-      final hasRetry = evt['hasRetry'] == 'true';
+      var hasRetry = evt['hasRetry'] == 'true';
+      if (!hasRetry) {
+        hasRetry = shouldAutoRetryOnOffline(type, title, text);
+      }
       showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
     }
+  }
+
+  /// Auto-retry check for "Remote desktop is offline" error.
+  /// returns true to auto-retry, false otherwise.
+  bool shouldAutoRetryOnOffline(
+    String type,
+    String title,
+    String text,
+  ) {
+    if (type == 'error' &&
+        title == 'Connection Error' &&
+        text == 'Remote desktop is offline' &&
+        _pi.isSet.isTrue) {
+      // Auto retry for ~30s (server's peer offline threshold) when controlled peer's account changes
+      // (e.g., signout, switch user, login into OS) causes temporary offline via websocket/tcp connection.
+      // The actual wait may exceed 30s (e.g., 20s elapsed + 16s next retry = 36s), which is acceptable
+      // since the controlled side reconnects quickly after account changes.
+      // Uses time-based check instead of _reconnects count because user can manually retry.
+      // https://github.com/rustdesk/rustdesk/discussions/14048
+      if (_offlineReconnectStartTime == null) {
+        // First offline, record time and start retry
+        _offlineReconnectStartTime = DateTime.now();
+        return true;
+      } else {
+        final elapsed =
+            DateTime.now().difference(_offlineReconnectStartTime!).inSeconds;
+        if (elapsed < 30) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   handleToast(Map<String, dynamic> evt, SessionID sessionId, String peerId) {
@@ -957,11 +1038,14 @@ class FfiModel with ChangeNotifier {
       _reconnects *= 2;
     } else {
       _reconnects = 1;
+      _offlineReconnectStartTime = null;
     }
   }
 
   void reconnect(OverlayDialogManager dialogManager, SessionID sessionId,
       bool forceRelay) {
+    // Disable relative mouse mode before reconnecting to ensure cursor is released.
+    parent.target?.inputModel.setRelativeMouseMode(false);
     bind.sessionReconnect(sessionId: sessionId, forceRelay: forceRelay);
     clearPermissions();
     dialogManager.dismissAll();
@@ -1078,16 +1162,16 @@ class FfiModel with ChangeNotifier {
           sessionId: sessionId,
           display:
               pi.currentDisplay == kAllDisplayValue ? 0 : pi.currentDisplay,
-          width: _rect!.width.toInt(),
-          height: _rect!.height.toInt(),
+          width: displays[0].width,
+          height: displays[0].height,
         );
       } else {
         for (int i = 0; i < displays.length; ++i) {
           bind.sessionSetSize(
             sessionId: sessionId,
             display: i,
-            width: displays[i].width.toInt(),
-            height: displays[i].height.toInt(),
+            width: displays[i].width,
+            height: displays[i].height,
           );
         }
       }
@@ -1096,6 +1180,14 @@ class FfiModel with ChangeNotifier {
 
   void _queryAuditGuid(String peerId) async {
     try {
+      if (bind.isDisableAccount()) {
+        return;
+      }
+      if (bind
+          .sessionGetAuditServerSync(sessionId: sessionId, typ: "conn/active")
+          .isEmpty) {
+        return;
+      }
       if (!mainGetLocalBoolOptionSync(
           kOptionAllowAskForNoteAtEndOfConnection)) {
         return;
@@ -1179,9 +1271,6 @@ class FfiModel with ChangeNotifier {
 
     _queryAuditGuid(peerId);
 
-    // This call is to ensuer the keyboard mode is updated depending on the peer version.
-    parent.target?.inputModel.updateKeyboardMode();
-
     // Map clone is required here, otherwise "evt" may be changed by other threads through the reference.
     // Because this function is asynchronous, there's an "await" in this function.
     cachedPeerData.peerInfo = {...evt};
@@ -1193,6 +1282,17 @@ class FfiModel with ChangeNotifier {
 
     parent.target?.dialogManager.dismissAll();
     _pi.version = evt['version'];
+    // Note: Relative mouse mode is NOT auto-enabled on connect.
+    // Users must manually enable it via toolbar or keyboard shortcut (Ctrl+Alt+Shift+M).
+    //
+    // For desktop/webDesktop, keyboard mode initialization is handled later by
+    // checkDesktopKeyboardMode() which may change the mode if not supported,
+    // followed by updateKeyboardMode() to sync InputModel.keyboardMode.
+    // For mobile, updateKeyboardMode() is currently a no-op (only executes on desktop/web),
+    // but we call it here for consistency and future-proofing.
+    if (isMobile) {
+      parent.target?.inputModel.updateKeyboardMode();
+    }
     _pi.isSupportMultiUiSession =
         bind.isSupportMultiUiSession(version: _pi.version);
     _pi.username = evt['username'];
@@ -1261,6 +1361,7 @@ class FfiModel with ChangeNotifier {
       }
       if (displays.isNotEmpty) {
         _reconnects = 1;
+        _offlineReconnectStartTime = null;
         waitForFirstImage.value = true;
         isRefreshing = false;
       }
@@ -1294,7 +1395,11 @@ class FfiModel with ChangeNotifier {
     stateGlobal.resetLastResolutionGroupValues(peerId);
 
     if (isDesktop || isWebDesktop) {
-      checkDesktopKeyboardMode();
+      // checkDesktopKeyboardMode may change the keyboard mode if the current
+      // mode is not supported. Re-sync InputModel.keyboardMode afterwards.
+      // Note: updateKeyboardMode() is a no-op on mobile (early-returns).
+      await checkDesktopKeyboardMode();
+      await parent.target?.inputModel.updateKeyboardMode();
     }
 
     notifyListeners();
@@ -1436,8 +1541,17 @@ class FfiModel with ChangeNotifier {
     d.cursorEmbedded = evt['cursor_embedded'] == 1;
     d.originalWidth = evt['original_width'] ?? kInvalidResolutionValue;
     d.originalHeight = evt['original_height'] ?? kInvalidResolutionValue;
-    double v = (evt['scale']?.toDouble() ?? 100.0) / 100;
-    d._scale = v > 1.0 ? v : 1.0;
+    d._scale = 1.0;
+    final scaledWidth = evt['scaled_width'];
+    if (scaledWidth != null) {
+      final sw = int.tryParse(scaledWidth.toString());
+      if (sw != null && sw > 0 && d.width > 0) {
+        d._scale = max(d.width.toDouble() / sw, 1.0);
+      } else {
+        debugPrint(
+            "Invalid scaled_width ($scaledWidth) or width (${d.width}), using default scale 1.0");
+      }
+    }
     return d;
   }
 
@@ -2101,10 +2215,32 @@ class CanvasModel with ChangeNotifier {
     double w = size.width - leftToEdge - rightToEdge;
     double h = size.height - topToEdge - bottomToEdge;
     if (isMobile) {
+      // Account for horizontal safe area insets on both orientations.
+      w = w - mediaData.padding.left - mediaData.padding.right;
+      // Vertically, subtract the bottom keyboard inset (viewInsets.bottom) and any
+      // bottom overlay (e.g. key-help tools) so the canvas is not covered.
       h = h -
           mediaData.viewInsets.bottom -
           (parent.target?.cursorModel.keyHelpToolsRectToAdjustCanvas?.bottom ??
               0);
+      // Orientation-specific handling:
+      //  - Portrait: additionally subtract top padding (e.g. status bar / notch)
+      //  - Landscape: does not subtract mediaData.padding.top/bottom (home indicator auto-hides)
+      final isPortrait = size.height > size.width;
+      if (isPortrait) {
+        // In portrait mode, subtract the top safe-area padding (e.g. status bar / notch)
+        // so the remote image is not truncated, while keeping the bottom inset to avoid
+        // introducing unnecessary blank space around the canvas.
+        //
+        // iOS -> Android, portrait, adjust mode:
+        // h = h (no padding subtracted): top and bottom are truncated
+        //   https://github.com/user-attachments/assets/30ed4559-c27e-432b-847f-8fec23c9f998
+        // h = h - top - bottom: extra blank spaces appear
+        //   https://github.com/user-attachments/assets/12a98817-3b4e-43aa-be0f-4b03cf364b7e
+        // h = h - top (current): works fine
+        //   https://github.com/user-attachments/assets/95f047f2-7f47-4a36-8113-5023989a0c81
+        h = h - mediaData.padding.top;
+      }
     }
     return Size(w < 0 ? 0 : w, h < 0 ? 0 : h);
   }
@@ -2435,11 +2571,6 @@ class CanvasModel with ChangeNotifier {
     setScrollPercent(scrollPixelPercent.x, scrollPixelPercent.y);
     pushScrollPositionToUI(scrollPixel.x, scrollPixel.y);
 
-    notifyListeners();
-  }
-
-  set scale(v) {
-    _scale = v;
     notifyListeners();
   }
 
@@ -2976,9 +3107,10 @@ class CursorModel with ChangeNotifier {
     var cx = r.center.dx;
     var cy = r.center.dy;
     var tryMoveCanvasX = false;
+    final displayRect = parent.target?.ffiModel.rect;
     if (dx > 0) {
       final maxCanvasCanMove = _displayOriginX +
-          (parent.target?.imageModel.image!.width ?? 1280) -
+          (displayRect?.width ?? 1280) -
           r.right.roundToDouble();
       tryMoveCanvasX = _x + dx > cx && maxCanvasCanMove > 0;
       if (tryMoveCanvasX) {
@@ -3000,7 +3132,7 @@ class CursorModel with ChangeNotifier {
     var tryMoveCanvasY = false;
     if (dy > 0) {
       final mayCanvasCanMove = _displayOriginY +
-          (parent.target?.imageModel.image!.height ?? 720) -
+          (displayRect?.height ?? 720) -
           r.bottom.roundToDouble();
       tryMoveCanvasY = _y + dy > cy && mayCanvasCanMove > 0;
       if (tryMoveCanvasY) {
@@ -3750,6 +3882,8 @@ class FFI {
     ffiModel.clear();
     canvasModel.clear();
     inputModel.resetModifiers();
+    // Dispose relative mouse mode resources to ensure cursor is restored
+    inputModel.disposeRelativeMouseMode();
     if (closeSession) {
       await bind.sessionClose(sessionId: sessionId);
     }
